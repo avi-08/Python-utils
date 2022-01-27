@@ -1,22 +1,21 @@
 import argparse
 import requests
-import time
 import json
 from pprint import pprint
+from retry import retry
 
 
 NIMBUS_API_BASE_URL = 'http://nimbus-api.eng.vmware.com/api'
 EXECUTE_NIMBUS_COMMAND = '/v1/launcher/nimbus/ctl'
 GET_COMMAND_EXECUTION_STATUS = '/v1/launcher/nimbus/{0}/status'
+DELAY = 15
+TIMEOUT = 120
+RETRY_COUNT = TIMEOUT // DELAY
 
 
 class NimbusLeaseExtend:
-
-    def __init__(self):
-        pass
-
     @staticmethod
-    def _execute_nimbus_command(payload):
+    def execute_nimbus_command(payload):
         try:
             api_url = NIMBUS_API_BASE_URL + EXECUTE_NIMBUS_COMMAND
             print(f'Method: POST API: {api_url} Payload: {payload}')
@@ -24,12 +23,16 @@ class NimbusLeaseExtend:
             if r.status_code == requests.codes.ok:
                 return r.json()
             else:
-                print(f'Execute command failed. \n Status code: {r.status_code} \n Response: {r.text}')
-        except Exception as e:
-            print("Failed to execute command." + e.with_traceback())
+                message = f'Execute command failed. \n Status code: {r.status_code} \n Response: {r.text}'
+                print(message)
+                raise IOError(message)
+        except Exception as ex:
+            message = f"Failed to execute command.\nError: {ex}"
+            print(message)
+            raise IOError(message)
 
     @staticmethod
-    def _get_command_execution_status(task_id):
+    def get_command_execution_status(task_id):
         try:
             api_url = NIMBUS_API_BASE_URL + GET_COMMAND_EXECUTION_STATUS.format(task_id)
             print(f'Method: GET API: {api_url}')
@@ -40,6 +43,23 @@ class NimbusLeaseExtend:
                 print(f'Get command status failed. \n Status code: {r.status_code} \n Response: {r.text}')
         except Exception as e:
             print("Failed to execute command." + e)
+    
+    @staticmethod
+    def dump_to_file(file_path, contents):
+        try:
+            with open(file_path, 'w') as fout:
+                fout.write(contents)
+        except IOError as ex:
+            print(f"Failed to write to file: {file_path};\nError: {ex}")
+        print(f"Updated {file_path} succcessfully.")
+    
+    @staticmethod    
+    def dump_success(message):
+        NimbusLeaseExtend.dump_to_file('success.txt', message)
+    
+    @staticmethod
+    def dump_failure(message):
+        NimbusLeaseExtend.dump_to_file('failure.txt', message)
 
     def _get_testbeds(self, params):
         payload = {
@@ -49,7 +69,7 @@ class NimbusLeaseExtend:
                 "nimbusLocation": params.location
             }
         }
-        return self._execute_nimbus_command(payload=payload)['id']
+        return self.execute_nimbus_command(payload=payload)['id']
 
     def _extend_lease(self, params, testbed_name):
         payload = {
@@ -60,48 +80,55 @@ class NimbusLeaseExtend:
                 "nimbusLocation": params.location
             }
         }
-        return self._execute_nimbus_command(payload=payload)['id']
+        return self.execute_nimbus_command(payload=payload)['id']
 
-    def _poll_task(self, task_id, timeout=120, interval=10):
-        retry_count = timeout // interval
-        while retry_count > 0:
-            res = self._get_command_execution_status(task_id)
-            status = res['status'].upper()
-            if status == "SUCCEEDED":
-                print(f'Task status is {status}')
-                return res
-            if status == "FAILED":
-                print(f'Task status is {status}')
-                return None
-            else:
-                print(f'Current task status is {status}, polling task status in {interval} seconds')
-            time.sleep(interval)
-            retry_count = retry_count - 1
-        print("Poll Nimbus task timed out after %s seconds" % timeout)
-        return None
-
-    def nimbus_lease_extend_workflow(self, params):
+    @retry(ValueError, delay=DELAY, tries=RETRY_COUNT)
+    def _poll_task(self, task_id):
+        res = self.get_command_execution_status(task_id)
+        status = res['status'].upper()
+        if status == "SUCCEEDED":
+            print(f'Task status is {status}')
+            return res
+        if status == "FAILED":
+            print(f'Task status is {status}')
+            return None
+        else:
+            raise ValueError(f'Current task status is {status}, polling task status in 15 seconds')
+    
+    def get_testbed_names(self, params):
         if params.testbed_name:
-            print(f'Extending lease of specified testbed [{params.testbed_name}] ...')
-            task_id = self._extend_lease(args, params.testbed_name)
-            response = self._poll_task(task_id)
-            if response:
-                print(f'Successfully extended lease for testbed [{params.testbed_name}]')
+            return [params.testbed_name]
         else:
             print('Getting available testbeds...')
             task_id = self._get_testbeds(params)
             response = self._poll_task(task_id)
+            testbeds = []
             if response:
                 pods_list = response['result']
                 pprint(pods_list)
                 for _, v in pods_list.items():
                     for testbed in v.values():
-                        print(f'Extending lease of testbed [{testbed["name"]}] ...')
-                        task_id = self._extend_lease(args, testbed["name"])
-                        response = self._poll_task(task_id)
-                        if response:
-                            print(f'Successfully extended lease for testbed [{testbed["name"]}]')
-        print('*************** Finished *************')
+                        testbeds.append(testbed["name"])
+            return testbeds
+    
+    def nimbus_lease_extend_workflow(self, params):
+        try:
+            testbed_names = self.get_testbed_names(params)
+            for index, testbed in enumerate(testbed_names):
+                print(f'Extending lease of testbed [{testbed}] ...')
+                task_id = self._extend_lease(args, testbed)
+                response = self._poll_task(task_id)
+                if response:
+                    print(f'Successfully extended lease for testbed [{testbed}]')
+            if len(testbed_names) > 0:
+                success_message = f"Successfully extended lease for testbeds: {testbed_names}"
+            else:
+                success_message = "No testbeds found for extending lease."
+            NimbusLeaseExtend.dump_success(success_message)
+            print('*************** Finished *************')
+        except Exception as ex:
+            NimbusLeaseExtend.dump_failure(f"Failed to extend testbed lease for testbeds: {testbed_names[index:]}\n{ex}")
+            raise ex
 
 
 if __name__ == '__main__':
